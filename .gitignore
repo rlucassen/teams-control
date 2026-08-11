@@ -1,0 +1,11 @@
+# Local configuration - contains your Pi's IP/hostname, SSH
+# username, and key path. Copy config.example.ps1 to config.ps1
+# instead of editing/committing this.
+config.ps1
+
+# OS / editor junk
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.vscode/
+*.log
