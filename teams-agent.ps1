@@ -101,6 +101,57 @@ $script:StateCondition =
 # UI AUTOMATION HELPERS
 # ============================================================
 
+# Every FindFirst/FindAll below is scoped to Teams' own top-level
+# window(s) rather than the whole desktop.
+#
+# Searching from AutomationElement.RootElement with
+# TreeScope.Descendants walks the UI Automation tree of *every*
+# open window (browsers, Electron/Chromium apps, etc.), which can
+# take seconds. Get-TeamsWindows first lists top-level windows with
+# TreeScope.Children (cheap - it does not descend into them) and
+# keeps only the ones belonging to a Teams process, so subsequent
+# Descendants searches only walk Teams' own UI tree.
+function Get-TeamsWindows {
+
+    $teamsProcessIds =
+        @(
+            Get-Process -Name "ms-teams" -ErrorAction SilentlyContinue
+            Get-Process -Name "Teams" -ErrorAction SilentlyContinue
+        ) |
+        Select-Object -ExpandProperty Id -Unique
+
+
+    if (-not $teamsProcessIds) {
+        return @()
+    }
+
+
+    $topLevelWindows =
+        $script:UiRoot.FindAll(
+            [System.Windows.Automation.TreeScope]::Children,
+            [System.Windows.Automation.Condition]::TrueCondition
+        )
+
+
+    $result = @()
+
+
+    foreach ($window in $topLevelWindows) {
+
+        try {
+
+            if ($teamsProcessIds -contains $window.Current.ProcessId) {
+                $result += $window
+            }
+        }
+        catch {}
+    }
+
+
+    return $result
+}
+
+
 function Find-ElementByAutomationId {
 
     param(
@@ -116,10 +167,26 @@ function Find-ElementByAutomationId {
         )
 
 
-    return $script:UiRoot.FindFirst(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        $condition
-    )
+    foreach ($window in (Get-TeamsWindows)) {
+
+        try {
+
+            $found =
+                $window.FindFirst(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    $condition
+                )
+
+
+            if ($found) {
+                return $found
+            }
+        }
+        catch {}
+    }
+
+
+    return $null
 }
 
 
@@ -171,12 +238,22 @@ function Get-TeamsState {
 
     try {
 
-        # One UI Automation scan for all relevant controls.
-        $elements =
-            $script:UiRoot.FindAll(
-                [System.Windows.Automation.TreeScope]::Descendants,
-                $script:StateCondition
-            )
+        # One UI Automation scan (per Teams window) for all
+        # relevant controls.
+        $elements = @()
+
+        foreach ($window in (Get-TeamsWindows)) {
+
+            try {
+
+                $elements +=
+                    $window.FindAll(
+                        [System.Windows.Automation.TreeScope]::Descendants,
+                        $script:StateCondition
+                    )
+            }
+            catch {}
+        }
 
 
         $mic   = $null
@@ -381,11 +458,23 @@ function Select-PreferredShareScreen {
     # Wait up to roughly 3 seconds.
     for ($i = 0; $i -lt 60; $i++) {
 
-        $screenList =
-            $script:UiRoot.FindFirst(
-                [System.Windows.Automation.TreeScope]::Descendants,
-                $screenListCondition
-            )
+        foreach ($window in (Get-TeamsWindows)) {
+
+            try {
+
+                $screenList =
+                    $window.FindFirst(
+                        [System.Windows.Automation.TreeScope]::Descendants,
+                        $screenListCondition
+                    )
+            }
+            catch {}
+
+
+            if ($screenList) {
+                break
+            }
+        }
 
 
         if ($screenList) {
