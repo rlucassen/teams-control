@@ -7,7 +7,11 @@ Set fso = CreateObject("Scripting.FileSystemObject")
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 agentScript = fso.BuildPath(scriptDir, "teams-agent.ps1")
 
+' Wait (True) so wscript.exe stays alive for the agent's whole
+' lifetime - Task Scheduler tracks wscript.exe directly, so this
+' keeps the task's Status/End/Run in sync with the real process
+' (a non-waiting Run made Task Scheduler lose track of it).
 shell.Run _
     "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & agentScript & """", _
     0, _
-    False
+    True

@@ -214,9 +214,11 @@ or out of range, the first detected screen is used instead.
 UI Automation needs to run inside the interactive desktop session that has
 Teams open, so this can't run as a hidden SYSTEM service — Task Scheduler
 running at user logon is the simplest reliable option.
-[start-teams-agent.vbs](start-teams-agent.vbs) launches
-`teams-agent.ps1` through `wscript.exe` with `WindowStyle Hidden` and a
-non-waiting `shell.Run`, so no console window or taskbar icon ever appears.
+[start-teams-agent.vbs](start-teams-agent.vbs) launches `teams-agent.ps1`
+through `wscript.exe` (a GUI-subsystem host, so it never has a console
+window of its own) with a *waiting* `shell.Run`, so no console window ever
+appears and Task Scheduler tracks `wscript.exe` for the agent's whole
+lifetime.
 
 1. Open **Task Scheduler** → **Create Task…** (not "Create Basic Task", so
    all options are available).
@@ -231,18 +233,34 @@ non-waiting `shell.Run`, so no console window or taskbar icon ever appears.
    AC power" if this runs on a laptop.
 6. **Settings** tab: optionally enable "If the task fails, restart every
    ..." for resilience.
-7. Save, then log off/on (or right-click the task → **Run**) to verify it
-   starts silently. Check Task Manager's "Details" tab for a
-   `powershell.exe` process to confirm it's running.
+7. Save, then log off/on (or right-click the task → **Run**) to verify:
+   - No console window appears on start.
+   - The task's **Status** column stays **Running** for as long as the
+     agent runs.
+   - Right-click the task → **End** (or **Run** → **End**) stops the agent.
+     Right-click → **Run** starts it again.
 
 > [!NOTE]
-> Because `start-teams-agent.vbs` launches `teams-agent.ps1` detached (via a
-> non-waiting `shell.Run`), Task Scheduler's status column reverts to
-> **Ready** almost immediately even while the agent keeps running in the
-> background — that's expected, not a failure. Since the agent is no longer
-> tied to the scheduled task, use
-> [tools/restart-teams-agent.ps1](tools/restart-teams-agent.ps1) to stop or
-> restart it rather than ending the task from Task Scheduler:
+> Plain `powershell.exe -WindowStyle Hidden` as the Program/script (with
+> the task's "Hidden" box ticked) is **not** reliable — on some Windows
+> builds the console window shows up anyway, fully visible, not just a
+> brief flash. `conhost.exe --headless powershell.exe ...` reliably
+> suppresses the window too, but neither that nor the VBS wrapper actually
+> gets its child process killed by Task Scheduler's End/Run —
+> **confirmed by testing**: Task Scheduler's Stop/End (whether via the GUI,
+> `Stop-ScheduledTask`, or `schtasks.exe /End`) only terminates the one
+> process it directly launched (`wscript.exe`/`conhost.exe`), never its
+> children, for "Run only when user is logged on" tasks. `teams-agent.ps1`
+> therefore checks every ~500ms whether its launcher process is still alive
+> and shuts itself down (stopping its `ssh.exe` transport too) within about
+> a second of the launcher dying — this is what actually makes Task
+> Scheduler's End/Run work end-to-end, regardless of which
+> window-hiding wrapper is used.
+>
+> [tools/restart-teams-agent.ps1](tools/restart-teams-agent.ps1) remains
+> available as a scriptable alternative that stops the agent (and its
+> `ssh.exe` transport) by matching command lines directly, without going
+> through Task Scheduler at all:
 >
 > ```powershell
 > # Stop it

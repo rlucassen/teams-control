@@ -40,6 +40,11 @@ if (-not (Test-Path $ConfigPath)) {
 
 . $ConfigPath
 
+# Older config.ps1 files may not define this yet.
+if (-not $UnreachableRetryDelaySeconds) {
+    $UnreachableRetryDelaySeconds = 60
+}
+
 
 # ============================================================
 # INITIALIZATION
@@ -52,6 +57,13 @@ $script:UiRoot =
     [System.Windows.Automation.AutomationElement]::RootElement
 
 $script:SshProcess = $null
+
+# Task Scheduler's Stop/End only terminates the process it directly
+# launched (wscript.exe/conhost.exe when running as a scheduled task),
+# never this script - so this script has to notice its launcher died and
+# exit itself. Captured once; a launcher's PID is never reassigned to it.
+$script:LauncherProcessId =
+    (Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
 
 
 # ============================================================
@@ -812,6 +824,86 @@ function Invoke-TeamsCommand {
 
 
 # ============================================================
+# NETWORK
+# ============================================================
+
+# Cheap check so the reconnect loop doesn't spend ~15-20s
+# spawning and waiting on ssh.exe just to find out the Pi isn't
+# even on this network (e.g. away from home).
+function Test-PiReachable {
+
+    param(
+        [int]$TimeoutMilliseconds = 2000
+    )
+
+    $client = New-Object System.Net.Sockets.TcpClient
+
+    try {
+
+        $result = $client.BeginConnect($PiHost, 22, $null, $null)
+
+        if (-not $result.AsyncWaitHandle.WaitOne($TimeoutMilliseconds)) {
+            return $false
+        }
+
+        $client.EndConnect($result)
+
+        return $true
+    }
+    catch {
+
+        return $false
+    }
+    finally {
+
+        $client.Close()
+    }
+}
+
+
+# ============================================================
+# LAUNCHER MONITORING
+# ============================================================
+
+# True if the process that launched us (or no known launcher) is still
+# alive. A stale/reused PID could in theory produce a false positive, but
+# that's an acceptable risk for this use case.
+function Test-LauncherAlive {
+
+    if (-not $script:LauncherProcessId) {
+        return $true
+    }
+
+    return [bool](
+        Get-Process -Id $script:LauncherProcessId -ErrorAction SilentlyContinue
+    )
+}
+
+
+# Sleeps in small increments instead of one long Start-Sleep, so a killed
+# launcher is noticed within ~500ms instead of only after the full delay.
+function Wait-WhileLauncherAlive {
+
+    param(
+        [int]$Seconds
+    )
+
+    $deadline = (Get-Date).AddSeconds($Seconds)
+
+    while ((Get-Date) -lt $deadline) {
+
+        if (-not (Test-LauncherAlive)) {
+            return $false
+        }
+
+        Start-Sleep -Milliseconds 500
+    }
+
+    return $true
+}
+
+
+# ============================================================
 # SSH / NETCAT TRANSPORT
 # ============================================================
 
@@ -838,14 +930,23 @@ function Start-Transport {
     # -l : listen
     # -k : keep accepting new TCP clients after disconnect
     #
+    # A sleeping/hibernating Windows host can leave the previous nc
+    # listener behind on the Pi. Remove only this app's old listener
+    # for the configured port before exec'ing the live one.
+    #
     # stdin/stdout of nc are carried through the SSH session.
 
     $remoteCommand =
-        "nc -lk 127.0.0.1 $Port"
+        "sh -c 'for i in 1 2 3; do pgrep -u `$(id -u) -f -- `"^nc -lk 127[.]0[.]0[.]1 $Port`" 2>/dev/null | xargs -r kill -9; sleep 0.2; done; exec nc -lk 127.0.0.1 $Port'"
 
 
     $arguments =
         "-T " +
+        "-o ConnectTimeout=5 " +
+        "-o BatchMode=yes " +
+        "-o StrictHostKeyChecking=accept-new " +
+        "-o ServerAliveInterval=5 " +
+        "-o ServerAliveCountMax=2 " +
         "-i `"$SshKey`" " +
         "${PiUser}@${PiHost} " +
         "`"$remoteCommand`""
@@ -991,23 +1092,35 @@ Write-Host "====================================================="
 Write-Host ""
 
 
+$script:ShutdownRequested = $false
+
 try {
 
-    while ($true) {
+    while (-not $script:ShutdownRequested) {
+
+        if (-not (Test-PiReachable)) {
+
+            Write-Warning (
+                "Pi not reachable at ${PiHost}:22. " +
+                "Retrying in $UnreachableRetryDelaySeconds seconds..."
+            )
+
+            if (-not (Wait-WhileLauncherAlive -Seconds $UnreachableRetryDelaySeconds)) {
+                $script:ShutdownRequested = $true
+            }
+
+            continue
+        }
+
 
         $ssh = $null
+        $subscription = $null
 
 
         try {
 
             $ssh =
                 Start-Transport
-
-
-            # stdout from ssh == data received by nc from
-            # Companion.
-            $reader =
-                $ssh.StandardOutput
 
 
             # stdin to ssh == data written by nc back to
@@ -1022,19 +1135,43 @@ try {
 
 
             # ------------------------------------------------
-            # BLOCKING LOOP
-            #
-            # ReadLine() consumes essentially no CPU while
-            # waiting.
+            # Read stdout asynchronously (OutputDataReceived)
+            # instead of blocking on ReadLine(), so this loop
+            # can also poll Test-LauncherAlive - a blocking
+            # ReadLine() would never notice a killed launcher.
             #
             # Because nc uses -k, Companion may disconnect and
             # reconnect without restarting this SSH session.
             # ------------------------------------------------
 
+            $outputQueue =
+                [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+
+            $subscription =
+                Register-ObjectEvent -InputObject $ssh -EventName OutputDataReceived -Action {
+                    $Event.MessageData.Enqueue($EventArgs.Data)
+                } -MessageData $outputQueue
+
+            $ssh.BeginOutputReadLine()
+
             while (-not $ssh.HasExited) {
 
-                $line =
-                    $reader.ReadLine()
+                if (-not (Test-LauncherAlive)) {
+
+                    Write-Warning "Launcher process is gone. Shutting down."
+
+                    $script:ShutdownRequested = $true
+
+                    break
+                }
+
+
+                $line = $null
+
+                if (-not $outputQueue.TryDequeue([ref]$line)) {
+                    Start-Sleep -Milliseconds 200
+                    continue
+                }
 
 
                 # EOF means ssh/nc ended.
@@ -1101,7 +1238,10 @@ try {
             }
 
 
-            if ($ssh.HasExited) {
+            if ($script:ShutdownRequested) {
+                # Nothing to warn about - this is a normal stop.
+            }
+            elseif ($ssh.HasExited) {
 
                 Write-Warning (
                     "SSH transport exited. Exit code: " +
@@ -1124,7 +1264,17 @@ try {
         }
         finally {
 
+            if ($subscription) {
+                Unregister-Event -SourceIdentifier $subscription.Name -ErrorAction SilentlyContinue
+                Remove-Job -Name $subscription.Name -Force -ErrorAction SilentlyContinue
+            }
+
             Stop-Transport
+        }
+
+
+        if ($script:ShutdownRequested) {
+            continue
         }
 
 
@@ -1134,8 +1284,9 @@ try {
         )
 
 
-        Start-Sleep `
-            -Seconds $ReconnectDelaySeconds
+        if (-not (Wait-WhileLauncherAlive -Seconds $ReconnectDelaySeconds)) {
+            $script:ShutdownRequested = $true
+        }
     }
 }
 finally {
