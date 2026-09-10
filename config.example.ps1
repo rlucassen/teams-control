@@ -31,6 +31,12 @@ $SshExe = "$env:WINDIR\System32\OpenSSH\ssh.exe"
 # Seconds to wait before reconnecting after the transport drops.
 $ReconnectDelaySeconds = 5
 
+# Seconds to wait between attempts while the Pi's SSH port can't be
+# reached at all (e.g. this computer is on a different network than the
+# Pi, such as at the office). Kept separate from $ReconnectDelaySeconds
+# so a dropped-but-reachable transport still retries quickly.
+$UnreachableRetryDelaySeconds = 60
+
 # Which screen to share when the "share" command starts sharing, as a
 # 1-based index into the screens Teams lists in its "Choose screen"
 # picker (order as detected — not necessarily left-to-right).
