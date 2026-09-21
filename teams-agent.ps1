@@ -937,7 +937,7 @@ function Start-Transport {
     # stdin/stdout of nc are carried through the SSH session.
 
     $remoteCommand =
-        "sh -c 'for i in 1 2 3; do pgrep -u `$(id -u) -f -- `"^nc -lk 127[.]0[.]0[.]1 $Port`" 2>/dev/null | xargs -r kill -9; sleep 0.2; done; exec nc -lk 127.0.0.1 $Port'"
+        "sh -c 'for i in 1 2 3; do fuser -k -9 $Port/tcp 2>/dev/null; sleep 0.2; done; exec nc -lk 127.0.0.1 $Port'"
 
 
     $arguments =
